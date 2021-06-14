@@ -1,273 +1,425 @@
+'use strict'
 /* eslint-env browser */
-/* global browser, jsonToDOM */
+/* globals chrome, Utils */
 
-/** global: browser */
-/** global: jsonToDOM */
+const { agent, open, i18n, getOption, setOption, promisify, sendMessage } =
+  Utils
 
-let pinnedCategory = null;
-let termsAccepted = false;
+const baseUrl = 'https://www.wappalyzer.com'
+const utm = '?utm_source=popup&utm_medium=extension&utm_campaign=wappalyzer'
 
-const port = browser.runtime.connect({
-  name: 'popup.js',
-});
+const footers = [
+  {
+    heading: 'Generate sales leads',
+    body: 'Find new prospects by the technologies they use. Reach out to customers of Shopify, Magento, Salesforce and others.',
+    buttonText: 'Create a lead list',
+    buttonLink: `${baseUrl}/lists/${utm}`,
+  },
+  {
+    heading: 'Connect Wappalyzer to your CRM',
+    body: 'See the technology stacks of your leads without leaving your CRM. Connect to HubSpot, Pipedrive and many others.',
+    buttonText: 'See all apps',
+    buttonLink: `${baseUrl}/apps/${utm}`,
+  },
+  {
+    heading: 'Enrich your data with tech stacks',
+    body: 'Upload a list of websites to get a report of the technologies in use, such as CMS or ecommerce platforms.',
+    buttonText: 'Upload a list',
+    buttonLink: `${baseUrl}/lookup/${utm}#bulk`,
+  },
+  {
+    heading: 'Automate technology lookups',
+    body: 'Our APIs provide instant access to website technology stacks, contact details and social media profiles.',
+    buttonText: 'Compare APIs',
+    buttonLink: `${baseUrl}/api/${utm}`,
+  },
+  {
+    heading: 'Wappalyzer for businesses',
+    body: 'Sign up for a plan to get monthly credits to spend on any product, including lead lists and technology lookups.',
+    buttonText: 'Compare plans',
+    buttonLink: `${baseUrl}/pricing/${utm}`,
+  },
+]
 
-function slugify(string) {
-  return string.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/--+/g, '-').replace(/(?:^-|-$)/, '');
-}
-
-function i18n() {
-  const nodes = document.querySelectorAll('[data-i18n]');
-
-  Array.prototype.forEach.call(nodes, (node) => {
-    node.innerHTML = browser.i18n.getMessage(node.dataset.i18n);
-  });
-}
-
-function replaceDom(domTemplate) {
-  const container = document.getElementsByClassName('container')[0];
-
-  while (container.firstChild) {
-    container.removeChild(container.firstChild);
-  }
-
-  container.appendChild(jsonToDOM(domTemplate, document, {}));
-
-  i18n();
-
-  Array.from(document.querySelectorAll('.detected__category-pin-wrapper')).forEach((pin) => {
-    pin.addEventListener('click', () => {
-      const categoryId = parseInt(pin.dataset.categoryId, 10);
-
-      if (categoryId === pinnedCategory) {
-        pin.className = 'detected__category-pin-wrapper';
-
-        pinnedCategory = null;
-      } else {
-        const active = document.querySelector('.detected__category-pin-wrapper--active');
-
-        if (active) {
-          active.className = 'detected__category-pin-wrapper';
-        }
-
-        pin.className = 'detected__category-pin-wrapper detected__category-pin-wrapper--active';
-
-        pinnedCategory = categoryId;
-      }
-
-      port.postMessage({
-        id: 'set_option',
-        key: 'pinnedCategory',
-        value: pinnedCategory,
-      });
-    });
-  });
-}
-
-function replaceDomWhenReady(dom) {
-  if (/complete|interactive|loaded/.test(document.readyState)) {
-    replaceDom(dom);
+function setDisabledDomain(enabled) {
+  if (enabled) {
+    document
+      .querySelector('.header__switch--enabled')
+      .classList.add('header__switch--hidden')
+    document
+      .querySelector('.header__switch--disabled')
+      .classList.remove('header__switch--hidden')
   } else {
-    document.addEventListener('DOMContentLoaded', () => {
-      replaceDom(dom);
-    });
+    document
+      .querySelector('.header__switch--enabled')
+      .classList.remove('header__switch--hidden')
+    document
+      .querySelector('.header__switch--disabled')
+      .classList.add('header__switch--hidden')
   }
 }
 
-function appsToDomTemplate(response) {
-  let template = [];
+const Popup = {
+  /**
+   * Initialise popup
+   */
+  async init() {
+    // Templates
+    Popup.templates = Array.from(
+      document.querySelectorAll('[data-template]')
+    ).reduce((templates, template) => {
+      templates[template.dataset.template] = template.cloneNode(true)
 
-  if (response.tabCache && Object.keys(response.tabCache.detected).length > 0) {
-    const categories = {};
+      template.remove()
 
-    // Group apps by category
-    for (const appName in response.tabCache.detected) {
-      response.apps[appName].cats.forEach((cat) => {
-        categories[cat] = categories[cat] || { apps: [] };
+      return templates
+    }, {})
 
-        categories[cat].apps[appName] = appName;
-      });
+    // Disabled domains
+    const dynamicIcon = await getOption('dynamicIcon', false)
+
+    if (dynamicIcon) {
+      document.querySelector('body').classList.add('dynamic-icon')
     }
 
-    for (const cat in categories) {
-      const apps = [];
+    // Disabled domains
+    let disabledDomains = await getOption('disabledDomains', [])
 
-      for (const appName in categories[cat].apps) {
-        const { confidence, version } = response.tabCache.detected[appName];
+    // Dark mode
+    const theme = await getOption('theme', 'light')
 
-        apps.push(
-          [
-            'a', {
-              class: 'detected__app',
-              target: '_blank',
-              href: `https://www.wappalyzer.com/technologies/${slugify(appName)}`,
-            }, [
-              'img', {
-                class: 'detected__app-icon',
-                src: `../images/icons/${response.apps[appName].icon || 'default.svg'}`,
-              },
-            ], [
-              'span', {
-                class: 'detected__app-name',
-              },
-              appName,
-            ], version ? [
-              'span', {
-                class: 'detected__app-version',
-              },
-              version,
-            ] : null, confidence < 100 ? [
-              'span', {
-                class: 'detected__app-confidence',
-              },
-              `${confidence}% sure`,
-            ] : null,
-          ],
-        );
-      }
-
-      template.push(
-        [
-          'div', {
-            class: 'detected__category',
-          }, [
-            'div', {
-              class: 'detected__category-name',
-            }, [
-              'a', {
-                class: 'detected__category-link',
-                target: '_blank',
-                href: `https://www.wappalyzer.com/categories/${slugify(response.categories[cat].name)}`,
-              },
-              browser.i18n.getMessage(`categoryName${cat}`),
-            ], [
-              'span', {
-                class: `detected__category-pin-wrapper${pinnedCategory == cat ? ' detected__category-pin-wrapper--active' : ''}`,
-                'data-category-id': cat,
-                title: browser.i18n.getMessage('categoryPin'),
-              }, [
-                'img', {
-                  class: 'detected__category-pin detected__category-pin--active',
-                  src: '../images/pin-active.svg',
-                },
-              ], [
-                'img', {
-                  class: 'detected__category-pin detected__category-pin--inactive',
-                  src: '../images/pin.svg',
-                },
-              ],
-            ],
-          ], [
-            'div', {
-              class: 'detected__apps',
-            },
-            apps,
-          ],
-        ],
-      );
+    if (theme === 'dark') {
+      document.querySelector('body').classList.add('dark')
+      document
+        .querySelector('.header__theme--light')
+        .classList.remove('header__icon--hidden')
+      document
+        .querySelector('.header__theme--dark')
+        .classList.add('header__icon--hidden')
     }
 
-    template = [
-      'div', {
-        class: 'detected',
-      },
-      template,
-    ];
-  } else {
-    template = [
-      'div', {
-        class: 'empty',
-      },
-      [
-        'span', {
-          class: 'empty__text',
-        },
-        browser.i18n.getMessage('noAppsDetected'),
-      ],
-    ];
-  }
+    // Terms
+    const termsAccepted =
+      agent === 'chrome' || (await getOption('termsAccepted', false))
 
-  return template;
-}
+    if (termsAccepted) {
+      document.querySelector('.terms').classList.add('terms--hidden')
+      document.querySelector('.empty').classList.remove('empty--hidden')
 
-async function getApps() {
-  try {
-    const tabs = await browser.tabs.query({
+      Popup.onGetDetections(await Popup.driver('getDetections'))
+    } else {
+      document.querySelector('.terms').classList.remove('terms--hidden')
+      document.querySelector('.detections').classList.add('detections--hidden')
+      document.querySelector('.empty').classList.add('empty--hidden')
+      document.querySelector('.footer').classList.add('footer--hidden')
+
+      document
+        .querySelector('.terms__button--accept')
+        .addEventListener('click', async () => {
+          await setOption('termsAccepted', true)
+          await setOption('tracking', true)
+
+          document.querySelector('.terms').classList.add('terms--hidden')
+          document.querySelector('.empty').classList.remove('empty--hidden')
+          document.querySelector('.footer').classList.remove('footer--hidden')
+
+          Popup.onGetDetections(await Popup.driver('getDetections'))
+        })
+
+      document
+        .querySelector('.terms__button--decline')
+        .addEventListener('click', async () => {
+          await setOption('termsAccepted', true)
+          await setOption('tracking', false)
+
+          document.querySelector('.terms').classList.add('terms--hidden')
+          document.querySelector('.empty').classList.remove('empty--hidden')
+          document.querySelector('.footer').classList.remove('footer--hidden')
+
+          Popup.onGetDetections(await Popup.driver('getDetections'))
+        })
+    }
+
+    const tabs = await promisify(chrome.tabs, 'query', {
       active: true,
       currentWindow: true,
-    });
+    })
 
-    port.postMessage({
-      id: 'get_apps',
-      tab: tabs[0],
-    });
-  } catch (error) {
-    console.error(error); // eslint-disable-line no-console
-  }
+    if (tabs && tabs.length) {
+      const [{ url }] = tabs
+
+      if (url.startsWith('http')) {
+        const { hostname } = new URL(url)
+
+        setDisabledDomain(disabledDomains.includes(hostname))
+
+        document
+          .querySelector('.header__switch--disabled')
+          .addEventListener('click', async () => {
+            disabledDomains = disabledDomains.filter(
+              (_hostname) => _hostname !== hostname
+            )
+
+            await setOption('disabledDomains', disabledDomains)
+
+            setDisabledDomain(false)
+
+            Popup.onGetDetections(await Popup.driver('getDetections'))
+          })
+
+        document
+          .querySelector('.header__switch--enabled')
+          .addEventListener('click', async () => {
+            disabledDomains.push(hostname)
+
+            await setOption('disabledDomains', disabledDomains)
+
+            setDisabledDomain(true)
+
+            Popup.onGetDetections(await Popup.driver('getDetections'))
+          })
+      } else {
+        for (const el of document.querySelectorAll('.header__switch')) {
+          el.classList.add('header__switch--hidden')
+        }
+      }
+    }
+
+    document
+      .querySelector('.header__settings')
+      .addEventListener('click', () => chrome.runtime.openOptionsPage())
+
+    // Theme
+    const body = document.querySelector('body')
+    const dark = document.querySelector('.header__theme--dark')
+    const light = document.querySelector('.header__theme--light')
+
+    document.querySelectorAll('.header__theme').forEach((el) =>
+      el.addEventListener('click', async () => {
+        const theme = await getOption('theme', 'light')
+
+        body.classList[theme === 'dark' ? 'remove' : 'add']('dark')
+        body.classList[theme === 'dark' ? 'add' : 'remove']('light')
+        dark.classList[theme === 'dark' ? 'remove' : 'add'](
+          'header__icon--hidden'
+        )
+        light.classList[theme === 'dark' ? 'add' : 'remove'](
+          'header__icon--hidden'
+        )
+
+        await setOption('theme', theme === 'dark' ? 'light' : 'dark')
+      })
+    )
+
+    // Footer
+    const item =
+      footers[
+        Math.round(Math.random())
+          ? 0
+          : Math.round(Math.random() * (footers.length - 1))
+      ]
+
+    document.querySelector('.footer__heading-text').textContent = item.heading
+    document.querySelector('.footer__content-body').textContent = item.body
+    document.querySelector('.footer__button-text').textContent = item.buttonText
+    document.querySelector('.footer__button-link').href = item.buttonLink
+
+    const collapseFooter = await getOption('collapseFooter', false)
+
+    const footer = document.querySelector('.footer')
+    const footerClose = document.querySelector('.footer__toggle--close')
+    const footerOpen = document.querySelector('.footer__toggle--open')
+
+    if (collapseFooter) {
+      footer.classList.add('footer--collapsed')
+      footerClose.classList.add('footer__toggle--hidden')
+      footerOpen.classList.remove('footer__toggle--hidden')
+    }
+
+    document
+      .querySelector('.footer__heading')
+      .addEventListener('click', async () => {
+        const collapsed = footer.classList.contains('footer--collapsed')
+
+        footer.classList[collapsed ? 'remove' : 'add']('footer--collapsed')
+        footerClose.classList[collapsed ? 'remove' : 'add'](
+          'footer__toggle--hidden'
+        )
+        footerOpen.classList[collapsed ? 'add' : 'remove'](
+          'footer__toggle--hidden'
+        )
+
+        await setOption('collapseFooter', !collapsed)
+      })
+
+    // Apply internationalization
+    i18n()
+  },
+
+  driver(func, args) {
+    return sendMessage('popup.js', func, args)
+  },
+
+  /**
+   * Log debug messages to the console
+   * @param {String} message
+   */
+  log(message) {
+    Popup.driver('log', message)
+  },
+
+  /**
+   * Group technologies into categories
+   * @param {Object} technologies
+   */
+  categorise(technologies) {
+    return Object.values(
+      technologies
+        .filter(({ confidence }) => confidence >= 50)
+        .reduce((categories, technology) => {
+          technology.categories.forEach((category) => {
+            categories[category.id] = categories[category.id] || {
+              ...category,
+              technologies: [],
+            }
+
+            categories[category.id].technologies.push(technology)
+          })
+
+          return categories
+        }, {})
+    )
+  },
+
+  /**
+   * Callback for getDetection listener
+   * @param {Array} detections
+   */
+  async onGetDetections(detections = []) {
+    detections = (detections || [])
+      .filter(({ confidence }) => confidence >= 50)
+      .filter(({ slug }) => slug !== 'cart-functionality')
+
+    if (!detections || !detections.length) {
+      document.querySelector('.empty').classList.remove('empty--hidden')
+      document.querySelector('.detections').classList.add('detections--hidden')
+      document.querySelector('.footer').classList.add('footer--hidden')
+
+      return
+    }
+
+    document.querySelector('.empty').classList.add('empty--hidden')
+    document.querySelector('.footer').classList.remove('footer--hidden')
+
+    const el = document.querySelector('.detections')
+
+    el.classList.remove('detections--hidden')
+
+    while (el.firstChild) {
+      el.removeChild(detections.lastChild)
+    }
+
+    const pinnedCategory = await getOption('pinnedCategory')
+
+    const categorised = Popup.categorise(detections)
+
+    categorised.forEach(({ id, name, slug: categorySlug, technologies }) => {
+      const categoryNode = Popup.templates.category.cloneNode(true)
+
+      const link = categoryNode.querySelector('.category__link')
+
+      link.href = `https://www.wappalyzer.com/technologies/${categorySlug}/?utm_source=popup&utm_medium=extension&utm_campaign=wappalyzer`
+      link.dataset.i18n = `categoryName${id}`
+
+      const pins = categoryNode.querySelectorAll('.category__pin')
+
+      if (pinnedCategory === id) {
+        pins.forEach((pin) => pin.classList.add('category__pin--active'))
+      }
+
+      pins.forEach((pin) =>
+        pin.addEventListener('click', async () => {
+          const pinnedCategory = await getOption('pinnedCategory')
+
+          Array.from(
+            document.querySelectorAll('.category__pin--active')
+          ).forEach((pin) => pin.classList.remove('category__pin--active'))
+
+          if (pinnedCategory === id) {
+            await setOption('pinnedCategory', null)
+          } else {
+            await setOption('pinnedCategory', id)
+
+            pins.forEach((pin) => pin.classList.add('category__pin--active'))
+          }
+        })
+      )
+
+      technologies.forEach(
+        ({ name, slug, confidence, version, icon, website }) => {
+          const technologyNode = Popup.templates.technology.cloneNode(true)
+
+          const image = technologyNode.querySelector('.technology__icon img')
+
+          image.src = `../images/icons/${icon}`
+
+          const link = technologyNode.querySelector('.technology__link')
+          const linkText = technologyNode.querySelector('.technology__name')
+
+          link.href = `https://www.wappalyzer.com/technologies/${categorySlug}/${slug}/?utm_source=popup&utm_medium=extension&utm_campaign=wappalyzer`
+          linkText.textContent = name
+
+          const confidenceNode = technologyNode.querySelector(
+            '.technology__confidence'
+          )
+
+          if (confidence < 100) {
+            confidenceNode.textContent = `${confidence}% sure`
+          } else {
+            confidenceNode.remove()
+          }
+
+          const versionNode = technologyNode.querySelector(
+            '.technology__version'
+          )
+
+          if (version) {
+            versionNode.textContent = version
+          } else {
+            versionNode.remove()
+          }
+
+          categoryNode
+            .querySelector('.technologies')
+            .appendChild(technologyNode)
+        }
+      )
+
+      document.querySelector('.detections').appendChild(categoryNode)
+    })
+
+    if (categorised.length === 1) {
+      document
+        .querySelector('.detections')
+        .appendChild(Popup.templates.category.cloneNode(true))
+    }
+
+    Array.from(document.querySelectorAll('a')).forEach((a) =>
+      a.addEventListener('click', (event) => {
+        event.preventDefault()
+
+        open(a.href)
+
+        return false
+      })
+    )
+
+    i18n()
+  },
 }
 
-/**
- * Async function to update body class based on option.
- */
-async function getThemeMode() {
-  try {
-    port.postMessage({
-      id: 'update_theme_mode',
-    });
-  } catch (error) {
-    console.error(error); // eslint-disable-line no-console
-  }
+if (/complete|interactive|loaded/.test(document.readyState)) {
+  Popup.init()
+} else {
+  document.addEventListener('DOMContentLoaded', Popup.init)
 }
-
-/**
- * Update theme mode based on browser option.
- * @param {object} res Response from port listener.
- */
-function updateThemeMode(res) {
-  if (res.hasOwnProperty('themeMode') && res.themeMode !== false) {
-    document.body.classList.add('theme-mode-sync');
-  }
-}
-function displayApps(response) {
-  pinnedCategory = response.pinnedCategory; // eslint-disable-line prefer-destructuring
-  termsAccepted = response.termsAccepted; // eslint-disable-line prefer-destructuring
-
-  if (termsAccepted) {
-    replaceDomWhenReady(appsToDomTemplate(response));
-  } else {
-    i18n();
-
-    const wrapper = document.querySelector('.terms__wrapper');
-
-    document.querySelector('.terms__accept').addEventListener('click', () => {
-      port.postMessage({
-        id: 'set_option',
-        key: 'termsAccepted',
-        value: true,
-      });
-
-      wrapper.classList.remove('terms__wrapper--active');
-
-      getApps();
-    });
-
-    wrapper.classList.add('terms__wrapper--active');
-  }
-}
-
-port.onMessage.addListener((message) => {
-  switch (message.id) {
-    case 'get_apps':
-      displayApps(message.response);
-
-      break;
-    case 'update_theme_mode':
-      updateThemeMode(message.response);
-
-      break;
-    default:
-      // Do nothing
-  }
-});
-
-getThemeMode();
-getApps();
